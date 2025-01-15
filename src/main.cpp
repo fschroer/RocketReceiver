@@ -5,6 +5,9 @@
 #define ss 12 //2024
 #define rst 14 //2024
 #define dio0 16 //2024
+#define ETX 3
+#define EM 25
+#define EOT 4
 
 //#define SOFT_LED1_PIN 12 //2022
 //#define SOFT_LED2_PIN 13 //2022
@@ -13,25 +16,13 @@
 //#define dio0 27 //13 //2022
 
 BluetoothSerial SerialBT;
-RocketGPS rocketGPS;
-EinkDisplay eink_display_;
 RocketConfig rocket_config_;
 
-volatile bool delay1Interrupt = false;
-hw_timer_t * delay1Timer = NULL;
-portMUX_TYPE delay1TimerMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool delay2Interrupt = false;
 hw_timer_t * delay2Timer = NULL;
 portMUX_TYPE delay2TimerMux = portMUX_INITIALIZER_UNLOCKED;
 
 char device_id_[sizeof(DEVICE_NAME) + sizeof(DEVICE_NUMBER) + 1];
-
-void IRAM_ATTR onDelay1Timer()
-{
-  portENTER_CRITICAL_ISR(&delay1TimerMux);
-  delay1Interrupt = true;
-  portEXIT_CRITICAL_ISR(&delay1TimerMux);
-}
 
 void IRAM_ATTR onDelay2Timer()
 {
@@ -43,9 +34,7 @@ void IRAM_ATTR onDelay2Timer()
 void setup() {
   sprintf(device_id_, "%s%d", DEVICE_NAME, DEVICE_NUMBER);
   Serial.begin(115200);
-  //while (!Serial);
   delay(1000);
-  eink_display_.Begin();
   tourActionsTaken = false;
   pinMode(SOFT_LED1_PIN, OUTPUT);
   pinMode(SOFT_LED2_PIN, OUTPUT);
@@ -62,22 +51,18 @@ void setup() {
     //while (1);
   }
   Serial.println("Starting LoRa success!");
-  rocketGPS.begin();
-  delay1Timer = timerBegin(1, 80, true);
-  timerAttachInterrupt(delay1Timer, &onDelay1Timer, true);
-  timerAlarmWrite(delay1Timer, DELAY1_MICROS, true);
-  timerAlarmEnable(delay1Timer);
   delay2Timer = timerBegin(2, 80, true);
   timerAttachInterrupt(delay2Timer, &onDelay2Timer, true);
   timerAlarmWrite(delay2Timer, DELAY2_MICROS, true);
   timerAlarmEnable(delay2Timer);
   digitalWrite(SOFT_LED1_PIN, LOW);
-  xTaskCreatePinnedToCore(display_service, "FlightService", 4096, NULL, 1, &display_task_handle_, 0); //Dedicated core 0 thread for altimeter functions
   display_state_ = DisplayState::kUnarmed;
   Serial.println("Setup complete.");
 }
 
 void loop() {
+  static char bluetooth_buffer[BT_BUFFER_SIZE];
+  static int buffer_offset = 0;
   if (delay2Interrupt){
     digitalWrite(SOFT_LED1_PIN, HIGH);
     timerStop(delay2Timer);
@@ -85,7 +70,6 @@ void loop() {
     portENTER_CRITICAL(&delay2TimerMux);
     delay2Interrupt = false;
     portEXIT_CRITICAL(&delay2TimerMux);
-    //Serial.println("Call display update");
     switch (user_command_){ // Timed to avoid sending message when Rocket Locator is transmitting.
       case UserCommand::kArm: //Arm Rocket Locator
         //Serial.println("Run");
@@ -101,8 +85,20 @@ void loop() {
         LoRa.endPacket();
         user_command_ = UserCommand::kNone;
         break;
+      case UserCommand::kUpdateConfig: //Send config to locator
+        Serial.print("Update Config: ");
+        for (int i = 0; i < sizeof(RocketSettings); i++)
+          Serial.printf("%02X ", config_data[i]);
+        Serial.println();
+        LoRa.beginPacket();
+        LoRa.print("CFG");
+        LoRa.write((uint8_t*)config_data, sizeof(RocketSettings));
+        LoRa.println();
+        LoRa.endPacket();
+        user_command_ = UserCommand::kNone;
+        break;
       case UserCommand::kTestDeployment1: //Test deployment channel 1
-        //Serial.println("TST1");
+        Serial.println("TST1");
         LoRa.beginPacket();
         LoRa.print("TST");
         LoRa.write(UserInteractionState::kTestDeploy1);
@@ -131,37 +127,97 @@ void loop() {
     }
     digitalWrite(SOFT_LED1_PIN, LOW);
   }
+  int btPacketSize = SerialBT.available();
+  if (btPacketSize) {
+    if (buffer_offset + btPacketSize > BT_BUFFER_SIZE) { //Overflow
+      Serial.println ("Overflow");
+      buffer_offset = 0;
+    }
+    SerialBT.readBytes(bluetooth_buffer + buffer_offset, btPacketSize);
+    Serial.printf("BT chars: ");
+    for (int i = buffer_offset; i < buffer_offset + btPacketSize; i++)
+      Serial.printf("%02X ", bluetooth_buffer[i]);
+    Serial.println();
+    if (bluetooth_buffer[buffer_offset + btPacketSize - 3] == ETX
+      && bluetooth_buffer[buffer_offset + btPacketSize - 2] == EM
+      && bluetooth_buffer[buffer_offset + btPacketSize - 1] == EOT) {
+      int bt_msg_size = buffer_offset + btPacketSize - 3;
+      Serial.print("BT msg: ");
+      for (int i = 0; i < buffer_offset + btPacketSize; i++)
+        Serial.printf("%02X ", bluetooth_buffer[i]);
+      Serial.println();
+      if (!strncmp(bluetooth_buffer, arm_cmd, sizeof(arm_cmd))) {
+        user_command_ = UserCommand::kArm;
+      }
+      else if (!strncmp(bluetooth_buffer, disarm_cmd, sizeof(disarm_cmd))) {
+        user_command_ = UserCommand::kDisarm;
+      }
+      else if (!strncmp(bluetooth_buffer, channel_cmd, sizeof(channel_cmd))) {
+        rocket_config_.SetLoraChannel(bluetooth_buffer[sizeof(channel_cmd)]);
+      }
+      else if (!strncmp(bluetooth_buffer, config_cmd, sizeof(config_cmd))) {
+        bt_msg_size -= sizeof(config_cmd);
+        int i = 0;
+        while (i < bt_msg_size) {
+          config_data[i] = bluetooth_buffer[i + sizeof(config_cmd)];
+          i++;
+        }
+        while (i < sizeof(RocketSettings)) {
+          config_data[i] = 0;
+          i++;
+        }
+        user_command_ = UserCommand::kUpdateConfig;
+      }
+      else if (!strncmp(bluetooth_buffer, test_cmd, sizeof(test_cmd))) {
+        Serial.printf("Test Message Channel: %d\r\n", bluetooth_buffer[sizeof(test_cmd)]);
+        switch (bluetooth_buffer[sizeof(test_cmd)]) {
+          case 0:
+            user_command_ = UserCommand::kCancelTestDeployment;
+            break;
+          case 1:
+            user_command_ = UserCommand::kTestDeployment1;
+            break;
+          case 2:
+            user_command_ = UserCommand::kTestDeployment2;
+            break;
+        }
+      }
+      buffer_offset = 0;
+    }
+    else {
+      buffer_offset = btPacketSize;
+    }
+  }
   //Serial.println("Checking for serial input");
   if (Serial.available()){
     //Serial.println("Serial input received");
     rocket_config_.ProcessChar(pre_launch_data_, &user_command_);
   }
-  //Serial.println("Checking GPS");
-  if (Serial1.available()){
-    //Serial.println("GPS data received");
-    rocketGPS.processGPSData();
-  }
-  int packetSize = LoRa.parsePacket();
+  uint8_t lora_channel = rocket_config_.LoraChannel();
   if (millis() - last_message_time > 2250){
-      //Serial.printf("Rocket locator timeout at %d. Restarting LoRa.\r\n", millis() - last_message_time);
+      Serial.printf("Rocket locator timeout at %d. Restarting LoRa.\r\n", millis() - last_message_time);
       LoRa.end();
       if (!LoRa.begin(rocket_config_.LoraFrequency()))
         Serial.println("Starting LoRa failed!");
-      //else
-        //Serial.printf("Restart on channel %d at %d succeeded\r\n", rocket_config_.LoraChannel(), millis() - last_message_time);
+      else
+        Serial.printf("Restart on channel %d at %d succeeded\r\n", rocket_config_.LoraChannel(), millis() - last_message_time);
     last_message_time = millis();
+    char channel_message[sizeof(channel_cmd) + sizeof(lora_channel)];
+    for (int i = 0; i < sizeof(channel_cmd); i++)
+      channel_message[i] = channel_cmd[i];
+    channel_message[sizeof(channel_cmd)] = lora_channel;
+    SerialBT.write((const uint8_t*)channel_message, sizeof(channel_message));
   }
+  int packetSize = LoRa.parsePacket();
   if (packetSize) {
     //Serial.println("LoRa packet received");
     digitalWrite(SOFT_LED2_PIN, HIGH);
-    timerStart(delay1Timer);
     timerStart(delay2Timer);
     last_message_time = millis();
-    char loraMsg[packetSize];
+    char loraMsg[packetSize + sizeof(lora_channel)];
     LoRa.readBytes(loraMsg, packetSize);
-    int i = 0;
-    while (i < packetSize)
-      SerialBT.write(loraMsg[i++]);
+    loraMsg[packetSize] = lora_channel;
+    SerialBT.write((const uint8_t*)(loraMsg), sizeof(loraMsg));
     if (!strncmp(loraMsg, "PRE", MSG_HDR_SIZE)){
       display_state_ = DisplayState::kUnarmed;
       decodePreLaunchMsg(loraMsg, packetSize);
@@ -219,6 +275,7 @@ void loop() {
     //Serial.println("Checked LoRa");
     LoRa.sleep();
     LoRa.idle();
+    digitalWrite(SOFT_LED2_PIN, LOW);
   }
 }
 
@@ -293,7 +350,6 @@ void updateLocatorGPSData(char *loraMsg, int packetSize){
   prevLongitude = dLongitude;
   dLatitude = (int)gps_data_.latitude / 100 + (gps_data_.latitude - ((int)gps_data_.latitude / 100 * 100)) / 60;
   dLongitude = (int)gps_data_.longitude / 100 + (gps_data_.longitude - ((int)gps_data_.longitude / 100 * 100)) / 60;
-  rocketGPS.setRemoteGPSCoordinates(dLatitude, dLongitude);
   //Serial.printf("GPS: %.6s %06d %06d %.5lf %.5lf %c %02d %.2f %.2f %.3s\n",
   //  gps_data_.sentenceType, gps_data_.dateStamp, gps_data_.timeStamp, gps_data_.latitude, gps_data_.longitude
   //  , gps_data_.qInd, gps_data_.satellites, gps_data_.hdop, gps_data_.altitude, gps_data_.checksum);
@@ -440,64 +496,4 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %0
   Serial.print("\t\t<gx:AnimatedUpdate>\n\t\t\t<Update>\n\t\t\t\t<targetHref></targetHref>\n\
 		\t\t\t\t<Change><Placemark targetId=\"Tri-Cities Rocketeers Launch Site\"><gx:balloonVisibility>0</gx:balloonVisibility></Placemark></Change>\n\
 		\t\t\t</Update>\n\t\t</gx:AnimatedUpdate>\n\t</gx:Playlist>\n</gx:Tour>\n</kml>\n");
-}
-
-void display_service(void* pvParameters) {
-  //static int i = 0;
-  //UBaseType_t uxHighWaterMark;
-  while(1){
-    if (delay1Interrupt){
-      //Serial.println("Loop Interrupt");
-      timerStop(delay1Timer);
-      timerRestart(delay1Timer);
-      portENTER_CRITICAL(&delay1TimerMux);
-      delay1Interrupt = false;
-      portEXIT_CRITICAL(&delay1TimerMux);
-      digitalWrite(SOFT_LED2_PIN, LOW);
-      //Serial.println("Call display update");
-      //Serial.println(display_state_);
-      switch (display_state_) {
-        case DisplayState::kArmed:
-          eink_display_.DisplayArmedStatus(flight_stats_.flight_state, sample_count_, flight_stats_.agl[0], rocketGPS.GetDistanceFromLatLon(), rocketGPS.GetBearingFromLatLon()
-            , rocketGPS.GetCompassBearingDegrees(), dLatitude, dLongitude, gps_data_.satellites, rocketGPS.getSatellites(), s_sample_time_, rocket_config_.LoraChannel());
-          break;
-        case DisplayState::kUnarmed:
-          eink_display_.DisplayUnarmedStatus(gps_data_.satellites, rocketGPS.getSatellites(), rocket_config_.LoraChannel(), pre_launch_data_, s_sample_time_, restart_message_);
-          break;
-        case DisplayState::kRestart:
-        eink_display_.DisplayRestartMessage(restart_message_);
-        break;
-      }
-    }
-    //Serial.printf("clock_start_: %d, millis: %d\r\n", clock_start_, millis());
-    if (millis() - clock_start_ > 5000){
-      //Serial.println("Rocket locator timeout");
-      //LoRa.end();
-      //if (!LoRa.begin(rocket_config_.LoraFrequency())) {
-      //  Serial.println("Starting LoRa failed!");
-        //while (1);
-      //}
-      //Serial.println("Starting LoRa success!");
-      //LoRa.sleep();
-      //LoRa.idle();
-      //eink_display_.DisplayNoStatus(rocketGPS.getSatellites(), rocket_config_.LoraChannel());
-      switch (display_state_) {
-        case DisplayState::kArmed:
-          eink_display_.DisplayArmedStatus(FlightStates::kNoSignal, sample_count_, flight_stats_.agl[0], rocketGPS.GetDistanceFromLatLon(), rocketGPS.GetBearingFromLatLon()
-            , rocketGPS.GetCompassBearingDegrees(), dLatitude, dLongitude, gps_data_.satellites, rocketGPS.getSatellites(), s_sample_time_, rocket_config_.LoraChannel());
-          break;
-        case DisplayState::kUnarmed:
-          eink_display_.DisplayNoStatus(rocketGPS.getSatellites(), rocket_config_.LoraChannel());
-          break;
-      }
-      clock_start_ = millis();
-    }
-    vTaskDelay(1);
-/*    if (++i == SAMPLES_PER_SECOND){
-      i = 0;
-      uxHighWaterMark = uxTaskGetStackHighWaterMark( NULL );
-      Serial.print("Task Stack High Water Mark: ");
-      Serial.println(uxHighWaterMark);
-    }*/
-  }
 }

@@ -31,25 +31,7 @@ void RocketConfig::ProcessChar(PreLaunch_t pre_launch_data, UserCommand *user_co
         else if (!strcmp(user_input_, restart_command_))
           ESP.restart();
         else if (user_input_[0] >= '0' && user_input_[0] <= '9' && (user_input_[1] == 0 || user_input_[1] >= '0' && user_input_[1] <= '9')){
-          int channel = atoi(user_input_);
-          if (channel >= 0 && channel < 64){
-            lora_channel_ = channel;
-            preferences.begin(DEVICE_NAME, false);
-            preferences.putChar(DEVICE_NAME, lora_channel_);
-            preferences.end();
-            LoRa.end();
-            if (!LoRa.begin(LoraFrequency())) {
-              Serial.println("Starting LoRa failed!");
-              //while (1);
-            }
-            Serial.println("Starting LoRa success!");
-            //LoRa.sleep();
-            //LoRa.idle();
-            //LoRa.setFrequency(LoraFrequency());
-            //LoRa.sleep();
-            //LoRa.idle();
-            Serial.printf("Setting channel = %d\r\n", lora_channel_);
-          }
+          SetLoraChannel(atoi(user_input_));
         }
         else if ((pre_launch_data.device_status & 0xF0) >> 4 == DeviceState::kStandby){
           //Serial.println("Device State = Standby");
@@ -99,6 +81,8 @@ void RocketConfig::ProcessChar(PreLaunch_t pre_launch_data, UserCommand *user_co
         for (int i = 0; i < DEVICE_NAME_LENGTH + 1; i++)
           pre_launch_data.rocket_settings.device_name[i] = device_name_[i];
         Serial.println("CFG");
+        for (int i = 0; i < sizeof(pre_launch_data.rocket_settings); i++)
+          Serial.printf("%02X ", ((uint8_t*)(&pre_launch_data.rocket_settings))[i]);
         LoRa.beginPacket();
         LoRa.print("CFG");
         LoRa.write((uint8_t*)&pre_launch_data.rocket_settings, sizeof(pre_launch_data.rocket_settings));
@@ -340,6 +324,22 @@ void RocketConfig::AdjustConfigTextSetting(char uart_char, char *config_mode_set
       Serial.print(uart_char);
       user_input_[char_pos++] = uart_char;
     }
+}
+
+void RocketConfig::SetLoraChannel(int channel) {
+  if (channel >= 0 && channel < 64){
+    lora_channel_ = channel;
+    preferences.begin(DEVICE_NAME, false);
+    preferences.putChar(DEVICE_NAME, lora_channel_);
+    preferences.end();
+    LoRa.end();
+    if (!LoRa.begin(LoraFrequency())) {
+      Serial.println("Starting LoRa failed!");
+      //while (1);
+    }
+    Serial.println("Starting LoRa success!");
+    Serial.printf("Setting channel = %d\r\n", lora_channel_);
+  }
 }
 
 void RocketConfig::ResetDeviceState(){

@@ -10,8 +10,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_I2CDevice.h>
 #include "BluetoothSerial.h"
-#include <RocketGPS.hpp>
-#include <EinkDisplay.hpp>
 #include <RocketConfig.hpp>
 
 #ifdef ROCKET_RECEIVER_1
@@ -23,6 +21,8 @@
 #ifdef ROCKET_RECEIVER_3
   #define DEVICE_NUMBER 3
 #endif
+
+#define BT_BUFFER_SIZE 10 + sizeof(RocketSettings)
 
 enum DisplayState{
   kUnarmed = 0,
@@ -50,7 +50,14 @@ TaskHandle_t display_task_handle_;
 UserCommand user_command_ = UserCommand::kNone;
 char restart_message_[MAX_RESTART_MESSAGE_SIZE] = {0};
 int last_message_time;
+char config_data[sizeof(RocketSettings)];
+const char arm_cmd[] = {'R', 'u', 'n'};
+const char disarm_cmd[] = {'S', 't', 'o', 'p'};
+const char channel_cmd[] = {'C', 'H', 'N'};
+const char config_cmd[] = {'C', 'F', 'G'};
+const char test_cmd[] = {'T', 'S', 'T'};
 
+void resetBTBuffer();
 void decodePreLaunchMsg(char *loraMsg, int packetSize);
 void decodeTelemetryMsg(char *loraMsg, int packetSize);
 void updateLocatorGPSData(char *loraMsg, int packetSize);

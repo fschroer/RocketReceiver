@@ -49,6 +49,7 @@ enum UserCommand
   kNone = 0,
   kArm,
   kDisarm,
+  kUpdateConfig,
   kTestDeployment1,
   kTestDeployment2,
   kCancelTestDeployment
@@ -58,6 +59,7 @@ class RocketConfig{
 public:
   RocketConfig();
   void ProcessChar(PreLaunch_t pre_launch_data, UserCommand *user_command);
+  void SetLoraChannel(int channel);
   void ResetDeviceState();
   void ResetUserInteractionState();
   uint8_t ReadLoraChannel();
