@@ -5,6 +5,9 @@
 #define ss 12 //2024
 #define rst 14 //2024
 #define dio0 16 //2024
+#define BATT_LEVEL_PIN 35
+#define RECEIVER_MIN_BATTERY_LEVEL 2000
+#define RECEIVER_MAX_BATTERY_LEVEL 2500
 #define ETX 3
 #define EM 25
 #define EOT 4
@@ -24,8 +27,7 @@ portMUX_TYPE delay2TimerMux = portMUX_INITIALIZER_UNLOCKED;
 
 char device_id_[sizeof(DEVICE_NAME) + sizeof(DEVICE_NUMBER) + 1];
 
-void IRAM_ATTR onDelay2Timer()
-{
+void IRAM_ATTR onDelay2Timer() {
   portENTER_CRITICAL_ISR(&delay2TimerMux);
   delay2Interrupt = true;
   portEXIT_CRITICAL_ISR(&delay2TimerMux);
@@ -46,6 +48,8 @@ void setup() {
   //LoRa.setSyncWord(0xF0);
   rocket_config_.ReadLoraChannel();
   Serial.printf("LoRa Frequency: %d\r\n", rocket_config_.LoraFrequency());
+  LoRa.setSpreadingFactor(6);
+  LoRa.setSignalBandwidth(500000);
   if (!LoRa.begin(rocket_config_.LoraFrequency())) {
     Serial.println("Starting LoRa failed!");
     //while (1);
@@ -63,14 +67,14 @@ void setup() {
 void loop() {
   static char bluetooth_buffer[BT_BUFFER_SIZE];
   static int buffer_offset = 0;
-  if (delay2Interrupt){
+  if (delay2Interrupt) {
     digitalWrite(SOFT_LED1_PIN, HIGH);
     timerStop(delay2Timer);
     timerRestart(delay2Timer);
     portENTER_CRITICAL(&delay2TimerMux);
     delay2Interrupt = false;
     portEXIT_CRITICAL(&delay2TimerMux);
-    switch (user_command_){ // Timed to avoid sending message when Rocket Locator is transmitting.
+    switch (user_command_) { // Timed to avoid sending message when Rocket Locator is transmitting.
       case UserCommand::kArm: //Arm Rocket Locator
         //Serial.println("Run");
         LoRa.beginPacket();
@@ -93,6 +97,22 @@ void loop() {
         LoRa.beginPacket();
         LoRa.print("CFG");
         LoRa.write((uint8_t*)config_data, sizeof(RocketSettings));
+        LoRa.println();
+        LoRa.endPacket();
+        user_command_ = UserCommand::kNone;
+        break;
+        case UserCommand::kFlightProfileMetadata: //Request flight profile metadata from locator
+        Serial.println("Send flight profile metadata request to locator");
+        LoRa.beginPacket();
+        LoRa.println("FPM");
+        LoRa.endPacket();
+        user_command_ = UserCommand::kNone;
+        break;
+      case UserCommand::kFlightProfileData: //Request flight profile data from locator
+        Serial.println("Send flight profile data request to locator");
+        LoRa.beginPacket();
+        LoRa.print("FPD");
+        LoRa.write(locator_archive_position_);
         LoRa.println();
         LoRa.endPacket();
         user_command_ = UserCommand::kNone;
@@ -168,6 +188,15 @@ void loop() {
         }
         user_command_ = UserCommand::kUpdateConfig;
       }
+      else if (!strncmp(bluetooth_buffer, flight_profile_metadata_cmd, sizeof(flight_profile_metadata_cmd))) {
+        Serial.println("Flight Profile Metadata Request");
+        user_command_ = UserCommand::kFlightProfileMetadata;
+      }
+      else if (!strncmp(bluetooth_buffer, flight_profile_data_cmd, sizeof(flight_profile_data_cmd))) {
+        Serial.println("Flight Profile Data Request");
+        user_command_ = UserCommand::kFlightProfileData;
+        locator_archive_position_ = bluetooth_buffer[sizeof(flight_profile_data_cmd)];
+      }
       else if (!strncmp(bluetooth_buffer, test_cmd, sizeof(test_cmd))) {
         Serial.printf("Test Message Channel: %d\r\n", bluetooth_buffer[sizeof(test_cmd)]);
         switch (bluetooth_buffer[sizeof(test_cmd)]) {
@@ -189,18 +218,18 @@ void loop() {
     }
   }
   //Serial.println("Checking for serial input");
-  if (Serial.available()){
+  if (Serial.available()) {
     //Serial.println("Serial input received");
     rocket_config_.ProcessChar(pre_launch_data_, &user_command_);
   }
   uint8_t lora_channel = rocket_config_.LoraChannel();
-  if (millis() - last_message_time > 2250){
-      Serial.printf("Rocket locator timeout at %d. Restarting LoRa.\r\n", millis() - last_message_time);
+  if (millis() - last_message_time > 2250) {
+      //Serial.printf("Rocket locator timeout at %d. Restarting LoRa.\r\n", millis() - last_message_time);
       LoRa.end();
       if (!LoRa.begin(rocket_config_.LoraFrequency()))
         Serial.println("Starting LoRa failed!");
-      else
-        Serial.printf("Restart on channel %d at %d succeeded\r\n", rocket_config_.LoraChannel(), millis() - last_message_time);
+      //else
+      //  Serial.printf("Restart on channel %d at %d succeeded\r\n", rocket_config_.LoraChannel(), millis() - last_message_time);
     last_message_time = millis();
     char channel_message[sizeof(channel_cmd) + sizeof(lora_channel)];
     for (int i = 0; i < sizeof(channel_cmd); i++)
@@ -209,44 +238,93 @@ void loop() {
     SerialBT.write((const uint8_t*)channel_message, sizeof(channel_message));
   }
   int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    //Serial.println("LoRa packet received");
+  if (packetSize > MSG_HDR_SIZE) {
+    
     digitalWrite(SOFT_LED2_PIN, HIGH);
     timerStart(delay2Timer);
     last_message_time = millis();
-    char loraMsg[packetSize + sizeof(lora_channel)];
-    LoRa.readBytes(loraMsg, packetSize);
-    loraMsg[packetSize] = lora_channel;
-    SerialBT.write((const uint8_t*)(loraMsg), sizeof(loraMsg));
-    if (!strncmp(loraMsg, "PRE", MSG_HDR_SIZE)){
+    char loraHeader[MSG_HDR_SIZE];
+    LoRa.readBytes(loraHeader, MSG_HDR_SIZE);
+    Serial.printf("LoRa %.3s packet received, %d bytes\r\n", loraHeader, packetSize);
+    //char flight_profile_data[FLIGHT_PROFILE_BUFFER_SIZE + MSG_HDR_SIZE];
+    if (!strncmp(loraHeader, "PRE", MSG_HDR_SIZE)) {
+      uint16_t battery_level = analogRead(BATT_LEVEL_PIN);
+      //Serial.printf("Battery raw: %d\n", battery_level);
+      //battery_level = battery_level * (2600.0 / 2100 * 4200 / 4096);
+      battery_level = battery_level * (4096.0 / 2370);
+      //Serial.printf("Battery full scale: %d\n", battery_level);
+      char loraMsg[packetSize + sizeof(lora_channel) + sizeof(battery_level)];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE);
+      loraMsg[packetSize] = lora_channel;
+      loraMsg[packetSize + sizeof(lora_channel)] = battery_level & 0xFF;
+      loraMsg[packetSize + sizeof(lora_channel) + 1] = battery_level >> 8;
+      dump_message_hex(loraMsg, packetSize + sizeof(lora_channel) + sizeof(battery_level), MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE, 40);
+      SerialBT.write((const uint8_t*)(loraMsg), sizeof(loraMsg));
       display_state_ = DisplayState::kUnarmed;
-      decodePreLaunchMsg(loraMsg, packetSize);
+      //decodePreLaunchMsg(loraMsg, packetSize);
       clock_start_ = millis();
     }
-    else if (!strncmp(loraMsg, "TLM", MSG_HDR_SIZE)){
+    else if (!strncmp(loraHeader, "TLM", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize);
+      SerialBT.write((const uint8_t*)(loraMsg), sizeof(loraMsg));
       display_state_ = DisplayState::kArmed;
-      decodeTelemetryMsg(loraMsg, packetSize);
-      if (flight_stats_.flight_state == FlightStates::kWaitingLaunch){
-        writeGpxTrackpoint();
-      }
-      else if (flight_stats_.flight_state <= FlightStates::kLanded){
-        writeGpxTrackpoint();
-      }
-      if (flight_stats_.flight_state >= FlightStates::kNoseover && !tourActionsTaken){
-        tourActionsTaken = true;
-        writeTourLookAt();
-      }
+      // decodeTelemetryMsg(loraMsg, packetSize);
+      // if (flight_stats_.flight_state == FlightStates::kWaitingLaunch) {
+      //   writeGpxTrackpoint();
+      // }
+      // else if (flight_stats_.flight_state <= FlightStates::kLanded) {
+      //   writeGpxTrackpoint();
+      // }
+      // if (flight_stats_.flight_state >= FlightStates::kNoseover && !tourActionsTaken) {
+      //   tourActionsTaken = true;
+      //   writeTourLookAt();
+      // }
       clock_start_ = millis();
     }
-    else if (!strncmp(loraMsg, "TST", MSG_HDR_SIZE)){
+    else if (!strncmp(loraHeader, "FPM", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE - MESSAGE_FOOTER_SIZE);
+      SerialBT.write((const uint8_t*)(loraMsg), sizeof(loraMsg));
+      Serial.printf("%02X\r\n", loraMsg[MSG_HDR_SIZE]);
+      dump_message_hex(loraMsg, packetSize, MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE, 40);
+    }
+    else if (!strncmp(loraHeader, "FPD", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE - MESSAGE_FOOTER_SIZE);
+      //for (int i = 0; i < packetSize - MSG_HDR_SIZE; i++) {
+      //  flight_profile_data[i + loraMsg[MSG_HDR_SIZE] * FLIGHT_PROFILE_BUFFER_SIZE] = loraMsg[i + MSG_HDR_SIZE + MESSAGE_SEQUENCE_SIZE];
+      //}
+      Serial.printf("%02X\r\n", loraMsg[MSG_HDR_SIZE]);
+      //dump_message_hex(loraMsg, packetSize, MSG_HDR_SIZE + MESSAGE_SEQUENCE_SIZE, packetSize - MSG_HDR_SIZE - MESSAGE_SEQUENCE_SIZE, 40);
+      //if (loraMsg[MSG_HDR_SIZE] == loraMsg[MSG_HDR_SIZE + 1] - 1)
+      //  dump_message_hex(flight_profile_data, FLIGHT_PROFILE_BUFFER_SIZE, 0, FLIGHT_PROFILE_BUFFER_SIZE, 40);
+    }
+    else if (!strncmp(loraHeader, "TST", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE);
       Serial.printf("Countdown: %d\r\n", loraMsg[3]);
-      if (loraMsg[3] == 0){
+      if (loraMsg[3] == 0) {
         Serial.println("Deployment test complete - exiting test mode.");
         rocket_config_.ResetDeviceState();
         rocket_config_.ResetUserInteractionState();
       }
     }
-    else if (!strncmp(loraMsg, "FSM", MSG_HDR_SIZE)){
+    else if (!strncmp(loraHeader, "FSM", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE);
       int i = 0;
       memcpy(&flight_stats_, &loraMsg[MSG_HDR_SIZE], FLIGHT_STATS_MSG_SIZE);
       Serial.printf("Flight State          : %d\n", flight_stats_.flight_state);
@@ -262,14 +340,22 @@ void loop() {
       Serial.printf("Landing               : %d\t%3.2f\n", flight_stats_.landing_sample_count, flight_stats_.landing_altitude);
       Serial.printf("Samples               : %d\n", flight_stats_.sample_count);
     }
-    else if (!strncmp("Rocket Locator", loraMsg, 14)){
+    else if (!strncmp(loraHeader, "Roc", MSG_HDR_SIZE)) {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE);
       int i = 0;
       for (; i < packetSize; i++)
         restart_message_[i] = loraMsg[i];
       restart_message_[i] = 0;
       display_state_ = DisplayState::kRestart;
     }
-    else{
+    else {
+      char loraMsg[packetSize];
+      for (int i = 0; i < MSG_HDR_SIZE; i++)
+        loraMsg[i] = loraHeader[i];
+      LoRa.readBytes(loraMsg + MSG_HDR_SIZE, packetSize - MSG_HDR_SIZE);
       Serial.print(loraMsg);
     }
     //Serial.println("Checked LoRa");
@@ -279,13 +365,33 @@ void loop() {
   }
 }
 
-void decodePreLaunchMsg(char *loraMsg, int packetSize){
+void dump_message_hex(char *message, int message_size, int header_size, int body_size, int body_line_break) {
+  int i = 0;
+  for (i = 0; i < header_size; i++)
+    Serial.printf("%02X ", message[i]);
+  Serial.println();
+  for (i = 0; i < message_size - header_size; i++) {
+    Serial.printf("%02X ", message[i + header_size]);
+    if (i % body_line_break == body_line_break - 1)
+      Serial.println();
+  }
+  if (i % body_line_break != body_line_break)
+    Serial.println();
+  int footer_size = message_size - header_size - body_size;
+  if (footer_size > 0) {
+    for (i = 0; i < footer_size; i++)
+      Serial.printf("%02X ", message[i + message_size - footer_size]);
+    Serial.println();
+  }
+}
+
+void decodePreLaunchMsg(char *loraMsg, int packetSize) {
   //Populate pre launch data from Lora message
   updateLocatorGPSData(loraMsg, packetSize);
   memcpy(&pre_launch_data_, loraMsg + MSG_HDR_SIZE + sizeof(gps_data_) - sizeof(gps_data_.sentenceType), sizeof(pre_launch_data_));
   //pre_launch_data_.device_name[10] = 0;
 /*  
-  for (int i = 0; i < packetSize; i++){
+  for (int i = 0; i < packetSize; i++) {
     Serial.printf("%02X ", loraMsg[i]);
     if (i == 39 || i == packetSize - 1)
       Serial.println();
@@ -306,13 +412,13 @@ void decodePreLaunchMsg(char *loraMsg, int packetSize){
   Serial.printf("deploy_signal_duration: %d\r\n", pre_launch_data_.rocket_settings.deploy_signal_duration);
   Serial.printf("device_name: %s\r\n", pre_launch_data_.rocket_settings.device_name);
   Serial.printf("battery_voltage_mvolt: %d\r\n", pre_launch_data_.battery_voltage_mvolt);
-  for (int i = 0; i < sizeof(pre_launch_data_); i++){
+  for (int i = 0; i < sizeof(pre_launch_data_); i++) {
     Serial.printf("%02X ", ((char*)&pre_launch_data_)[i]);
   }
   Serial.println();*/
 }
 
-void decodeTelemetryMsg(char *loraMsg, int packetSize){
+void decodeTelemetryMsg(char *loraMsg, int packetSize) {
   //Populate telemetry data from Lora message
   updateLocatorGPSData(loraMsg, packetSize);
   flight_stats_.flight_state = *(FlightStates*)(loraMsg + MSG_HDR_SIZE + sizeof(gps_data_) - sizeof(gps_data_.sentenceType));
@@ -325,7 +431,7 @@ void decodeTelemetryMsg(char *loraMsg, int packetSize){
   //Serial.printf("agl_f: %6.1f\r\n", agl_value_f);
   //int agl_values = (flight_stats_.flight_state > kLaunched && flight_stats_.flight_state < kLanded) ? SAMPLES_PER_SECOND : 1;
   //Serial.printf("agl_values: %d\r\n", agl_values);
-  for (int i = 0; i < ((flight_stats_.flight_state > kLaunched && flight_stats_.flight_state < kLanded) ? SAMPLES_PER_SECOND : 1); i++){
+  for (int i = 0; i < ((flight_stats_.flight_state > kLaunched && flight_stats_.flight_state < kLanded) ? SAMPLES_PER_SECOND : 1); i++) {
     flight_stats_.agl[i] = (float)*(uint16_t*)(loraMsg + MSG_HDR_SIZE + sizeof(gps_data_) - sizeof(gps_data_.sentenceType)
     + sizeof(flight_stats_.flight_state) + sizeof(sample_count_) + i * sizeof(uint16_t)) / ALTIMETER_SCALE;
     //Serial.printf("agl_f: %d - %6.1f\r\n", i, flight_stats_.agl[i]);
@@ -334,9 +440,9 @@ void decodeTelemetryMsg(char *loraMsg, int packetSize){
   //  Serial.printf("%6.2f ", flight_stats_.agl[i]);
 }
 
-void updateLocatorGPSData(char *loraMsg, int packetSize){
+void updateLocatorGPSData(char *loraMsg, int packetSize) {
   //Recreate NMEA message for Rocket Locator
-  /*for (int i = 0; i < packetSize; i++){
+  /*for (int i = 0; i < packetSize; i++) {
     Serial.printf("%02X ", loraMsg[i]);
     if (i == 2 || i == 39 || i == packetSize - 1)
       Serial.println();
@@ -358,7 +464,7 @@ void updateLocatorGPSData(char *loraMsg, int packetSize){
     SerialBT.write(gps_sentence_[i++]);*/
 }
   
-void writeGpxTrackpoint(){
+void writeGpxTrackpoint() {
   prev_sample_time_.tm_mday = sample_time_.tm_mday;
   prev_sample_time_.tm_mon = sample_time_.tm_mon;
   prev_sample_time_.tm_year = sample_time_.tm_year;
@@ -367,29 +473,29 @@ void writeGpxTrackpoint(){
   prev_sample_time_.tm_sec = sample_time_.tm_sec;
 
   //Write GPX file trackpoint - high velocity
-  if (flight_stats_.flight_state == FlightStates::kWaitingLaunch){
+  if (flight_stats_.flight_state == FlightStates::kWaitingLaunch) {
       Serial.printf("<trkpt lat=\"%.5lf\" lon=\"%.5lf\"><ele>%.2f</ele><time>%sZ</time></trkpt>\r\n",
         dLatitude, dLongitude, flight_stats_.agl[0] * FEET_PER_METER, s_sample_time_);
   }
-  if (flight_stats_.flight_state > FlightStates::kWaitingLaunch){
-    if(flight_stats_.flight_state < FlightStates::kDroguePrimaryDeployed){
+  if (flight_stats_.flight_state > FlightStates::kWaitingLaunch) {
+    if(flight_stats_.flight_state < FlightStates::kDroguePrimaryDeployed) {
       float latitudeDelta = dLatitude - prevLatitude;
       float longitudeDelta = dLongitude - prevLongitude;
-      for (int i = 0; i < SAMPLES_PER_SECOND; i++){
+      for (int i = 0; i < SAMPLES_PER_SECOND; i++) {
         Serial.printf("<trkpt lat=\"%.5lf\" lon=\"%.5lf\"><ele>%.2f</ele><time>%s.%d%dZ</time></trkpt>\r\n",
           prevLatitude + latitudeDelta * (i + 1) / SAMPLES_PER_SECOND, prevLongitude + longitudeDelta * (i + 1) / SAMPLES_PER_SECOND,
           flight_stats_.agl[i] * FEET_PER_METER, s_sample_time_, int((float)i / SAMPLES_PER_SECOND * 10), i % 2 * 5);
       }
     }
     //Write GPX file trackpoint - low velocity
-    else{
+    else {
       Serial.printf("<trkpt lat=\"%.5lf\" lon=\"%.5lf\"><ele>%.2f</ele><time>%sZ</time></trkpt>\r\n",
         dLatitude, dLongitude, flight_stats_.agl[0] * FEET_PER_METER, s_sample_time_);
     }
   }
 }
 
-void MakeDateTime(char *target, int date, int time){
+void MakeDateTime(char *target, int date, int time) {
   setenv("TZ", "UTC0", 1); // Set timezone to UTC
   tzset();
   tm *local_time;
@@ -409,7 +515,7 @@ void MakeDateTime(char *target, int date, int time){
   unsetenv("TZ");
 }
 
-void writeTour(){
+void writeTour() {
   float radius = 0.02;
   int startingAltitude = 600;
   int endingAltitude = gps_data_.altitude * FEET_PER_METER + 100;
@@ -424,7 +530,7 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %s
 \t\t<gx:AnimatedUpdate>\n\t\t\t<Update>\n\t\t\t\t<targetHref></targetHref>\n\
 \t\t\t\t<Change><Placemark targetId=\"Tri-Cities Rocketeers Launch Site\"><gx:balloonVisibility>1</gx:balloonVisibility></Placemark></Change>\n\
 \t\t\t</Update>\n\t\t</gx:AnimatedUpdate>\n", s_sample_time_);
-  for (; deg < 360; deg += 360 / circumSteps){
+  for (; deg < 360; deg += 360 / circumSteps) {
     Serial.printf("\t\t<gx:FlyTo>\n\t\t\t<gx:duration>1.0</gx:duration>\n\t\t\t<gx:flyToMode>smooth</gx:flyToMode>\n\t\t\t<Camera>\n\
 \t\t\t\t<gx:horizFov>60</gx:horizFov>\n\
 \t\t\t\t<longitude>%.5lf</longitude>\n\t\t\t\t<latitude>%.5lf</latitude>\n\
@@ -436,7 +542,7 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %s
       270 - deg,
       startingTilt);
   }
-  for (int i = flyInSteps - 1; i >= 0; i--){
+  for (int i = flyInSteps - 1; i >= 0; i--) {
     Serial.printf("\t\t<gx:FlyTo>\n\t\t\t<gx:duration>1.0</gx:duration>\n\t\t\t<gx:flyToMode>smooth</gx:flyToMode>\n\t\t\t<Camera>\n\
 \t\t\t\t<gx:horizFov>60</gx:horizFov>\n\
 \t\t\t\t<longitude>%.5lf</longitude>\n\t\t\t\t<latitude>%.5lf</latitude>\n\
@@ -453,7 +559,7 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %s
 		\t\t\t</Update>\n\t\t</gx:AnimatedUpdate>\n\t</gx:Playlist>\n</gx:Tour>\n</kml>\n");
 }
 
-void writeTourLookAt(){
+void writeTourLookAt() {
   int startingRange = 1200;
   int endingRange = 100;
   int deg = 360;
@@ -467,7 +573,7 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %0
 \t\t<gx:AnimatedUpdate>\n\t\t\t<Update>\n\t\t\t\t<targetHref></targetHref>\n\
 \t\t\t\t<Change><Placemark targetId=\"Tri-Cities Rocketeers Launch Site\"><gx:balloonVisibility>1</gx:balloonVisibility></Placemark></Change>\n\
 \t\t\t</Update>\n\t\t</gx:AnimatedUpdate>\n", s_sample_time_);
-  for (; deg > 0; deg -= 360 / circumSteps){
+  for (; deg > 0; deg -= 360 / circumSteps) {
     Serial.printf("\t\t<gx:FlyTo>\n\t\t\t<gx:duration>1.0</gx:duration>\n\t\t\t<gx:flyToMode>smooth</gx:flyToMode>\n\t\t\t<LookAt>\n\
 \t\t\t\t<gx:horizFov>60</gx:horizFov>\n\
 \t\t\t\t<longitude>%.5lf</longitude>\n\t\t\t\t<latitude>%.5lf</latitude>\n\
@@ -480,7 +586,7 @@ xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<gx:Tour>\n\t<name>Rocket Flight %0
       deg,
       startingTilt);
   }
-  for (int i = flyInSteps - 1; i >= 0; i--){
+  for (int i = flyInSteps - 1; i >= 0; i--) {
     Serial.printf("\t\t<gx:FlyTo>\n\t\t\t<gx:duration>1.0</gx:duration>\n\t\t\t<gx:flyToMode>smooth</gx:flyToMode>\n\t\t\t<LookAt>\n\
 \t\t\t\t<gx:horizFov>60</gx:horizFov>\n\
 \t\t\t\t<longitude>%.5lf</longitude>\n\t\t\t\t<latitude>%.5lf</latitude>\n\

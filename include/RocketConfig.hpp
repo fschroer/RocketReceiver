@@ -50,6 +50,8 @@ enum UserCommand
   kArm,
   kDisarm,
   kUpdateConfig,
+  kFlightProfileMetadata,
+  kFlightProfileData,
   kTestDeployment1,
   kTestDeployment2,
   kCancelTestDeployment
